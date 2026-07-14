@@ -32,8 +32,8 @@ def startup_event() -> None:
     """Initialize database and seed flights if empty."""
     init_db()
     existing = count_flights()
-    if existing < 200000:
-        print(f"[flight_api] less than 200000 flights in DB, generating {TARGET_FLIGHTS} flights...")
+    if existing < 300000:
+        print(f"[flight_api] less than 300000 flights in DB, generating {TARGET_FLIGHTS} flights...")
         flights = generate_more_flights(TARGET_FLIGHTS)
         bulk_insert_flights(flights)
         print(f"[flight_api] Inserted {len(flights)} flights into DB")
@@ -57,9 +57,6 @@ def search_flights(
     Example:
     GET /flights?origin=ATH&destination=LHR&date=2025-12-01
     """
-
-    # simulate network latency (for thesis experiments)
-    time.sleep(random.uniform(0.2, 0.6))
 
     # basic date validation
     try:
@@ -92,9 +89,6 @@ def get_flight_by_id(flight_id: str) -> Dict[str, Any]:
     Example:
     GET /flights/FL-000123
     """
-
-    # simulate network latency (optional, a bit shorter)
-    time.sleep(random.uniform(0.1, 0.3))
 
     conn = get_conn()
     try:
@@ -148,8 +142,6 @@ def create_booking_endpoint(booking: BookingCreateRequest) -> Dict[str, Any]:
       "status": "CONFIRMED"
     }
     """
-    # Simulate network latency
-    time.sleep(random.uniform(0.1, 0.3))
     
     try:
         result = create_booking(
@@ -179,8 +171,6 @@ def get_booking_endpoint(booking_id: str) -> Dict[str, Any]:
     Example:
     GET /bookings/BK-abc123
     """
-    # Simulate network latency
-    time.sleep(random.uniform(0.1, 0.3))
     
     booking = get_booking(booking_id)
     
@@ -198,8 +188,7 @@ def get_user_bookings_endpoint(user_id: str = Query(...)) -> List[Dict[str, Any]
     Example:
     GET /bookings?user_id=user_001
     """
-    # Simulate network latency
-    time.sleep(random.uniform(0.1, 0.3))
+
     
     bookings = get_bookings_by_user(user_id)
     return bookings
@@ -220,8 +209,6 @@ def update_booking_endpoint(
       "cancellation_reason": "Customer requested"
     }
     """
-    # Simulate network latency
-    time.sleep(random.uniform(0.1, 0.3))
     
     result = update_booking_status(
         booking_id=booking_id,
@@ -244,8 +231,6 @@ def delete_booking_endpoint(booking_id: str) -> Dict[str, Any]:
     Example:
     DELETE /bookings/BK-abc123
     """
-    # Simulate network latency
-    time.sleep(random.uniform(0.1, 0.3))
     
     from db import delete_booking
     

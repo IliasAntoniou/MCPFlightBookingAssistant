@@ -5,46 +5,67 @@ import asyncio
 from pathlib import Path
 from contextlib import AsyncExitStack
 from typing import Optional, Dict, Any, List
+from typing import Union, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from uuid import uuid4
+from similarity_cache import Similarity_Cache
+from sentence_transformers import SentenceTransformer
+from exact_cache import Exact_Cache
 
 from dotenv import load_dotenv
 
-from google import genai
+import requests
+import time
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # --------------------------------------------------
-#  ENV + GEMINI CLIENT
+#  ENV + LLAMA CLIENT
 # --------------------------------------------------
 # Load .env from the same directory as this script
 ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-API_KEY = os.getenv("GOOGLE_AI_STUDIO_API_KEY")
-if not API_KEY:
-    raise RuntimeError("GOOGLE_AI_STUDIO_API_KEY not set in .env or env vars")
+# Local Ollama configuration
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 # Cheapest model available - uses 2.5-flash-lite which is very cost-efficient
 MODEL_NAME = "gemini-2.5-flash-lite"
 
-gemini_client = genai.Client(api_key=API_KEY)
+USE_SIMILARITY_CACHE = False
+USE_EXACT_CACHE = False
+
+#similarity cache initialization
+similaritycache = Similarity_Cache(cache_size=1000, threshold=0.99, embedding_model=SentenceTransformer("all-mpnet-base-v2"), eviction_policy="LRU")
+
+#exact cache initialization
+exactcache = Exact_Cache(cache_size=1000, eviction_policy="LRU")
+
+tool_call_request_key = None
+cached_tool_result = None
+
+# Validate that Ollama is reachable
+try:
+    requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+except Exception as e:
+    print(f"⚠️  Warning: Could not connect to Ollama at {OLLAMA_URL}: {e}")
 
 
 # --------------------------------------------------
-#  GEMINI + MCP HOST
+#  OLLAMA/LLAMA + MCP HOST
 # --------------------------------------------------
 
-class GeminiMCPHost:
+class OllamaMCPHost:
     """
     Host component that:
       - connects to multiple MCP servers (flightsearch, flightbooking) via stdio
-      - talks to Gemini
-      - optionally calls tools via MCP when Gemini asks
+      - talks to a local Ollama/Llama model
+      - optionally calls tools via MCP when the model asks
     """
 
     def __init__(self, server_script_paths: list[str]):
@@ -126,7 +147,9 @@ class GeminiMCPHost:
 
         system_prompt = f"""
 You are a flight booking assistant that can call tools to help users.
-
+THE MOST IMPORTANT PART IS READ THE USER QUESTION AND ONLY IF HE ASKS ABOUT AN ACTION CHECK IF YOU SHOULD USE A TOOL
+THE TOOL DESCRIPTIONS ARE BELOW, READ THEM CAREFULLY AND USE THEM WHEN NECESSARY WITH THE CORRECT ARGUMENTS.
+LOOK CAREFULLY AT THE TOOL CALLING RULES AND FOLLOW THEM EXACTLY. DISTRINGUISH BOOK FROM SEARCH.
 AVAILABLE TOOLS:
 {tools_block}
 
@@ -143,6 +166,8 @@ TOOL CALLING RULES:
 2. If you can answer without a tool, respond normally with helpful text.
 
 3. destinations should be in IATA code format (e.g. ATH, BCN).
+
+4. Dates should be in YYYY-MM-DD format.s
 EXAMPLES:
 User: "search flights from ATH to BCN on 2025-12-03"
 Response: {{"tool": "search_flights", "args": {{"origin": "ATH", "destination": "BCN", "date": "2025-12-03"}}}}
@@ -184,12 +209,38 @@ RESPONSE FORMATTING (for non-tool answers):
             context_text = "\n\nRecent conversation:\n" + "\n".join(context_lines)
             print(f"📝 Conversation context ({len(recent_history)} messages):\n{context_text}")
 
-        # Ask Gemini whether to call a tool
-        initial_text = self._call_gemini(
+        # Ask Ollama whether to call a tool with conversation history
+        """
+        initial_text = self._call_ollama(
             f"{system_prompt}{user_context}{context_text}\n\nUser question:\n{query}"
         )
+        """
         
-        print(f"🤖 Gemini response: {initial_text[:200]}...")
+        ollama_start_time = time.perf_counter()
+        cached_response = None
+
+        if USE_SIMILARITY_CACHE:
+            cached_response = similaritycache.get(query)
+        if cached_response is not None and USE_SIMILARITY_CACHE:
+            print("Similarity Cache hit")
+            initial_text = cached_response
+            ollama_end_time = time.perf_counter()
+            ollama_duration = ollama_end_time - ollama_start_time
+            print(f"⏱️ Ollama response time (from cache): {ollama_duration:.2f} seconds")
+        else:
+            initial_text = self._call_ollama(
+            f"{system_prompt}{user_context}\n\nUser question:\n{query}"
+            )
+            if USE_SIMILARITY_CACHE:
+                similaritycache.put(query, initial_text)
+        
+        ollama_end_time = time.perf_counter()
+
+        ollama_duration = ollama_end_time - ollama_start_time
+
+        print(f"⏱️ Ollama response time: {ollama_duration:.2f} seconds")
+        
+        print(f"🤖 Model response: {initial_text[:200]}...")
         
         # Try to parse as JSON specifying a tool call
         parsed = self._extract_json(initial_text)
@@ -207,7 +258,7 @@ RESPONSE FORMATTING (for non-tool answers):
         tool_args = parsed.get("args", {}) or {}
 
         # Request authorization from user
-        return {
+        auth_response = {
             "reply": f"The AI wants to call the tool: **{tool_name}**\n\nArguments: {json.dumps(tool_args, indent=2)}\n\nDo you authorize this action?",
             "needs_authorization": True,
             "tool_request": {
@@ -223,8 +274,10 @@ RESPONSE FORMATTING (for non-tool answers):
                 "user_info": user_info
             }
         }
+        
+        return auth_response
 
-    async def execute_tool_call(self, tool_name: str, tool_args: Dict[str, Any], query: str, conversation_history: List[Dict[str, str]] = None, user_info: Dict[str, str] = None) -> str: # type: ignore
+    async def execute_tool_call(self, tool_name: str, tool_args: Dict[str, Any], query: str, conversation_history: List[Dict[str, str]] = None, user_info: Dict[str, str] = None, benchmark_mode: bool = False) -> Union[str, Tuple[str, float, float]]:
         """
         Execute the authorized tool call and return final answer.
         """
@@ -237,8 +290,26 @@ RESPONSE FORMATTING (for non-tool answers):
         if user_info is None:
             user_info = {}
 
+        tool_llama_duration = 0.0
+        tool_start_time = time.perf_counter()
         # Find which session has this tool
         call_result = None
+
+        tool_cache_key = json.dumps({"tool": tool_name,"args": tool_args},sort_keys=True)
+
+        if USE_EXACT_CACHE:
+            cached_tool_result = exactcache.get(tool_cache_key)
+
+        if USE_EXACT_CACHE and cached_tool_result is not None:
+            print("Exact cache hit for tool result")
+            tool_end_time = time.perf_counter()
+            tool_duration = tool_end_time - tool_start_time
+            print(f"⏱️ Tool execution time (from cache): {tool_duration:.2f} seconds")
+
+            if benchmark_mode:
+                return cached_tool_result, tool_duration, tool_llama_duration
+            return cached_tool_result
+            
         for server_name, session in self.sessions.items():
             tools_response = await session.list_tools()
             tool_names = [t.name for t in tools_response.tools]
@@ -250,7 +321,7 @@ RESPONSE FORMATTING (for non-tool answers):
                     break
                 except Exception as e:
                     error_text = f"Error calling tool '{tool_name}' with args {tool_args}: {e}"
-                    return self._call_gemini(
+                    return self._call_ollama(
                         f"User question: {query}\n\n"
                         f"There was an error calling the tool:\n{error_text}\n\n"
                         f"Explain the error to the user in normal natural language."
@@ -261,13 +332,20 @@ RESPONSE FORMATTING (for non-tool answers):
 
         call_result_str = str(call_result)
 
+        tool_end_time = time.perf_counter()
+        tool_duration = tool_end_time - tool_start_time
+        print(f"⏱️ Tool execution time: {tool_duration:.2f} seconds")
+
+        tool_llama_start = time.perf_counter()
+
         # Build user info context
         user_context = ""
         if user_info and "user_id" in user_info:
             user_context = f"\n\nLogged-in user information:\n- User ID: {user_info.get('user_id', 'N/A')}\n- Name: {user_info.get('name', 'N/A')}\n- Email: {user_info.get('email', 'N/A')}\n"
 
-        # Get final answer from Gemini
-        final_answer = self._call_gemini(
+        # Get final answer from the local model
+
+        final_answer = self._call_ollama(
             f"""You are now writing a final answer for the user.
 Do NOT call any tools anymore and do NOT respond with JSON.
 Just answer in normal, helpful natural language.
@@ -291,143 +369,36 @@ Formatting guidelines:
 - If showing multiple flights, format them in a clean list
 """
         )
-
-        return final_answer
-
-    async def process_query(self, query: str) -> str:
-        """
-        Main brain:
-          1) Ask Gemini if it wants to call a tool (using a JSON convention)
-          2) If yes → call MCP tool
-          3) Ask Gemini again with tool result
-        """
-        if not self.sessions:
-            return "MCP sessions not initialized on server."
-
-        # 1) Get tools from all MCP servers
-        all_tools = []
-        for server_name, session in self.sessions.items():
-            tools_response = await session.list_tools()
-            all_tools.extend(tools_response.tools)
-        
-        tools = all_tools
-
-        # Build a human-readable tool description block
-        tool_lines = []
-        for t in tools:
-            try:
-                schema_json = json.dumps(t.inputSchema)
-            except TypeError:
-                # Fallback in case inputSchema isn't directly serializable
-                schema_json = str(t.inputSchema)
-            tool_lines.append(
-                f"- {t.name}: {t.description or ''} | schema: {schema_json}"
-            )
-        tools_block = "\n".join(tool_lines) if tool_lines else "(no tools)"
-
-        # 2) System-style instruction to Gemini (we do manual tool-calling)
-        system_prompt = f"""
-You are an assistant that can optionally call external tools via a tool broker.
-
-Here are the available tools (from an MCP server):
-{tools_block}
-
-When you need to call a tool to answer the user's question, respond **ONLY** with a JSON object, no extra text, in this form:
-
-{{
-  "tool": "<tool_name>",
-  "args": {{ ... }}
-}}
-
-Where:
-- "tool" is one of the tool names above
-- "args" is a JSON object matching that tool's input schema
-
-If you can answer directly **without** using a tool, respond with a normal natural language answer (no JSON).
-        """.strip()
-
-        # 3) First call: ask Gemini whether to call a tool or just answer
-        initial_text = self._call_gemini(
-            f"{system_prompt}\n\nUser question:\n{query}"
-        )
-        print("🔍 Gemini initial response:", repr(initial_text))
-
-        # Try to parse as JSON specifying a tool call
-        parsed = self._extract_json(initial_text)
-
-        if not parsed or "tool" not in parsed:
-            # Not a valid tool-call JSON → treat as normal answer
-            return initial_text
-
-        tool_name = parsed["tool"]
-        tool_args = parsed.get("args", {}) or {}
-
-        # 4) Call MCP tool - find which session has this tool
-        call_result = None
-        for server_name, session in self.sessions.items():
-            tools_response = await session.list_tools()
-            tool_names = [t.name for t in tools_response.tools]
-            if tool_name in tool_names:
-                try:
-                    print(f"🔧 Gemini requested tool: {tool_name} (from {server_name}) with args {tool_args}")
-                    call_result = await session.call_tool(tool_name, tool_args)
-                    break
-                except Exception as e:
-                    error_text = f"Error calling tool '{tool_name}' with args {tool_args}: {e}"
-                    return self._call_gemini(
-                        f"User question: {query}\n\n"
-                        f"There was an error calling the tool:\n{error_text}\n\n"
-                        f"Explain the error to the user in normal natural language."
-                    )
-        
-        if call_result is None:
-            return self._call_gemini(
-                f"User question: {query}\n\n"
-                f"Tool '{tool_name}' was requested but not found in any connected MCP server.\n\n"
-                f"Explain this to the user in normal natural language."
-            )
-
-        # `call_result` is a CallToolResult (MCP). We'll stringify it for Gemini.
-        call_result_str = str(call_result)
-
-        # 5) Second call: give Gemini the tool output and ask for final user-facing answer
-        final_answer = self._call_gemini(
-            f"""You are now writing a final answer for the user.
-Do NOT call any tools anymore and do NOT respond with JSON.
-Just answer in normal, helpful natural language.
-
-User question:
-{query}
-
-Tool '{tool_name}' was called with arguments:
-{json.dumps(tool_args, indent=2)}
-
-Tool returned (raw MCP result):
-{call_result_str}
-
-Please answer the user, summarizing the tool result in a helpful way.
-
-Formatting guidelines:
-- Use **bold** for important information (flight IDs, airports, prices)
-- Use bullet points (- or *) for lists of flights or options
-- Use `code` for IDs like flight numbers or booking IDs
-- Keep the response clear, organized, and easy to read
-- If showing multiple flights, format them in a clean list
-"""
-        )
-
+        print("saved in exact cache")
+        if USE_EXACT_CACHE:
+            exactcache.put(tool_cache_key, final_answer)
+        tool_llama_end = time.perf_counter()
+        tool_llama_duration = tool_llama_end - tool_llama_start
+        if benchmark_mode:
+            return final_answer, tool_duration, tool_llama_duration
         return final_answer
 
     @staticmethod
-    def _call_gemini(prompt: str) -> str:
+    def _call_ollama(prompt: str) -> str:
         """
-        Helper: single-turn Gemini call with text in/out.
+        Helper: single-turn Ollama/Llama call with text in/out.
         """
-        resp = gemini_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[{"role": "user", "parts": [{"text": prompt}]}],
-        )
-        return (resp.text or "").strip()
+        try:
+            response = requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                },
+                timeout=300
+            )
+            response.raise_for_status()
+            result = response.json()
+            return (result.get("response", "")).strip()
+        except Exception as e:
+            print(f"❌ Error calling Ollama: {e}")
+            return f"Error communicating with local Llama model: {e}"
 
     @staticmethod
     def _extract_json(text: str) -> Optional[dict]:
@@ -479,7 +450,7 @@ MCP_SERVER_SCRIPTS = [
     str(MCP_SERVERS_DIR / "flightbooking.py"),
 ]
 
-host = GeminiMCPHost(MCP_SERVER_SCRIPTS)
+host = OllamaMCPHost(MCP_SERVER_SCRIPTS)
 
 # Session storage for pending tool calls
 pending_tool_calls: Dict[str, Dict[str, Any]] = {}
@@ -520,8 +491,7 @@ async def on_shutdown():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Gemini + MCP host is running"}
-
+    return {"status": "ok", "message": "Ollama/Llama + MCP host is running"}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):

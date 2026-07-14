@@ -232,7 +232,7 @@ async def get_booking_via_api(booking_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_user_bookings_via_api(user_id: str) -> List[Dict[str, Any]]:
-    """Call the booking API to get all bookings for a user."""
+    """Call the booking API to get all bookings for a user USING the user ID."""
     url = f"{BOOKING_API_BASE}/bookings"
     
     try:
@@ -444,7 +444,7 @@ async def book_flight(
     seats: int = 1,
 ) -> str:
     """
-    Create a CONFIRMED booking for a given flight and user.
+    Create a CONFIRMED booking for a given flight id and user id.
     """
     logger.info(
         "book_flight tool called",
