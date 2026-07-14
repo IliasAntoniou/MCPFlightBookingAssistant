@@ -211,3 +211,7 @@ __marimo__/
 index_old.html
 index_new.html
 index_backup.html
+
+# Generated SQLite database (auto-created + seeded on first startup, see db.py)
+flight_app.db
+src/backend/flight_app.db

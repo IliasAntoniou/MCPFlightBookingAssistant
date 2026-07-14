@@ -34,9 +34,6 @@ load_dotenv(dotenv_path=ENV_PATH)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
-# Cheapest model available - uses 2.5-flash-lite which is very cost-efficient
-MODEL_NAME = "gemini-2.5-flash-lite"
-
 USE_SIMILARITY_CACHE = False
 USE_EXACT_CACHE = False
 
