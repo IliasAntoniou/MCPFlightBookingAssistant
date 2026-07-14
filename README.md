@@ -19,7 +19,7 @@ An AI-powered flight booking application demonstrating the Model Context Protoco
 │ - Conversation & session management                 │
 │ - Optional exact + semantic-similarity cache        │
 └──────┬───────────────────────────────┬──────────────┘
-       │ HTTP                          │ MCP Protocol (STDIO)
+       │ HTTP                          │ STDIO
        ▼                               ▼
 ┌──────────────────┐        ┌──────────┴───────────────┐
 │ Ollama Server    │        ▲                          ▲
