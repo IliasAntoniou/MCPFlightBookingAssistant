@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import asyncio
 from pathlib import Path
@@ -22,6 +23,12 @@ import time
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# Status messages below contain emoji; on Windows stdout defaults to cp1252,
+# which raises UnicodeEncodeError on them. Force UTF-8 output.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # --------------------------------------------------
 #  ENV + LLAMA CLIENT
